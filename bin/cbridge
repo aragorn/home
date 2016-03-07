@@ -1,0 +1,1246 @@
+#!/usr/bin/perl -w
+use FindBin;
+BEGIN { unshift @INC, "$FindBin::Bin/../lib"; }
+
+use Modern::Perl '2014';
+use diagnostics; # comment this out when you are done debugging
+use Getopt::Long qw(:config auto_version auto_help);
+use Pod::Usage;
+use Log::Log4perl qw(:easy);
+
+Bridge::Util->import(qw(elapsed_for_human));
+
+__PACKAGE__->main() unless caller;
+
+=head1 NAME
+
+cbridge - bridge tool according to ConvBridge interface
+
+=head1 SYNOPSIS
+
+ cbridge [-vh] <cmd> <argument...>
+ cbridge seed seed_url destination_pattern ...
+ cbridge pull source_url file [count]
+ cbridge pull source_url destination_url [count]
+ cbridge pull source_url
+ cbridge session source_url file
+ cbridge list [pattern ...]
+ cbridge resume session [count]
+ cbridge resume pattern ... [count]
+ cbridge status session
+ cbridge stop pattern ...
+ cbridge remove pattern ...
+
+=head1 DESCRIPTION
+
+cbridge is an Extract-Transform-Loader for search engines and heterogeneous
+databases. cbridge implements bridge in ConvBridge interface.
+
+=cut
+
+sub main {
+  our $VERSION = 1407;
+  our $VERSION_STRING = "1407";
+  
+  binmode STDIN,  ":encoding(UTF-8)";
+  binmode STDOUT, ":encoding(UTF-8)";
+  binmode STDERR, ":encoding(UTF-8)";
+  
+  our $SIGNALED_TO_QUIT = 0;
+  $SIG{__DIE__} = sub { ERROR($_[0]); };
+  $SIG{INT}  = sub { $SIGNALED_TO_QUIT++; };
+  $SIG{QUIT} = sub { $SIGNALED_TO_QUIT++; INFO("exits by SIGQUIT"); exit 1; };
+  
+  Log::Log4perl->easy_init( { level    => $ERROR,
+                              file     => 'STDERR',
+                              utf8     => 1,
+                              layout   => '%F{1}-%L-%M: %m%n',
+                            } );
+
+  my $verbose = 0;
+  GetOptions(
+    'verbose' => sub { $verbose++; },
+    'dir=s'   => sub { shift; Bridge::Session::session_dir(shift); },
+  ) or pod2usage(-verbose=>1, -input => $FindBin::Bin . "/" . $FindBin::Script);
+ 
+  # You should call get_logger("") to obtain the root logger.
+  get_logger("")->more_logging($verbose);
+  INFO("started as verbose=$verbose");
+
+  # Set process title
+  my $process_title_reserved = $0;
+  $0 = join(" ", 'cbridge', @ARGV); #'cbridge';
+
+  my $cmd = shift @ARGV;
+  pod2usage(-exitval => 2,
+            -input => $process_title_reserved, )
+    unless defined $cmd;
+
+  check_JSON_XS();
+  
+     if ( $cmd eq 'help' )    { pod2usage(0); }
+  elsif ( $cmd eq 'seed' )    { do_seed(@ARGV); }
+  elsif ( $cmd eq 'pull' )    { do_pull(@ARGV); }
+  elsif ( $cmd eq 'session' ) { do_session(@ARGV); }
+  elsif ( $cmd eq 'list' )    { do_list(@ARGV); }
+  elsif ( $cmd eq 'resume' )  { do_resume(@ARGV); }
+  elsif ( $cmd eq 'status' )  { do_status(@ARGV); }
+  elsif ( $cmd eq 'stop' )    { do_stop(@ARGV); }
+  elsif ( $cmd eq 'remove' )  { do_remove(@ARGV); }
+  elsif ( $cmd eq 'view' )    { xxx_view(@ARGV); }
+  elsif ( $cmd eq 'noop' )    { return; } # just get out of main()
+  else  { pod2usage(-message => "Unknown command, $cmd",
+                    -input => $process_title_reserved, );
+        }
+        # pod2usage exits with a status of 2 
+
+  exit;
+}
+
+sub check_JSON_XS {
+  print STDERR "Warning: JSON::XS is not available.\n"
+    unless JSON->backend->is_xs;
+}
+
+# And the rest is at the end of file.
+##############################################################################
+
+BEGIN {
+
+package Bridge::Util;
+use base qw(Exporter);
+our @ISA       = qw(Exporter);
+our @EXPORT    = qw(
+);
+our @EXPORT_OK = qw(
+  D E
+  name_from
+  next_urls_in_data
+  next_urls_in_json
+  elapsed_for_human
+  time_this
+);
+use Log::Log4perl qw(:easy);
+use JSON;
+use Encode;
+use File::Basename; # basename
+
+sub D { Encode::decode('UTF-8', shift, Encode::FB_DEFAULT); }
+sub E { Encode::encode('UTF-8', shift, Encode::FB_DEFAULT); }
+
+sub name_from {
+  $_ = shift;
+  m|^https?://|o and return _name_from_url($_);
+  #m|^/\w+|o      and return _name_from_path($_);
+  return _name_from_path($_);
+}
+
+sub _name_from_path {
+  shift;
+  my $basename = basename($_);
+  $basename =~ s/\./_/og;
+  return $basename;
+}
+
+sub _name_from_url {
+  my %stop_words = map { $_ => 1 }
+  qw(http convbridge v1 v2 static dynamic);
+
+  my @candidates = grep {
+    DEBUG("candidates: $_");
+    not $stop_words{$_} and length $_ > 3
+  } map {
+    s|^https?://([\w\-_]+\.)*\w+(:\d+)?/||o;
+    s/\W+/ /og;
+    split /\s+/o;
+  } map {
+    my $tmp = $_; $tmp;
+  } shift;
+
+  push @candidates, "unknown";
+  shift @candidates;
+}
+
+sub next_urls_in_data {
+  my $data = shift;
+  return unless ref $data eq 'HASH';
+
+  my ($name, undef) = grep { defined } map {
+    exists $data->{$_} ? $_ : undef;
+  } qw(next_urls next_url nextUrls nextUrl NextUrls NextUrl);
+  DEBUG("found: $name");
+ 
+  if (ref $data->{$name} eq 'ARRAY') {
+    my @urls = @{ $data->{$name} };
+    DEBUG("urls[".(scalar @urls)."]=(".join(",", @urls).")");
+    return @urls;
+  }
+  return;
+}
+
+sub next_urls_in_json {
+  my $json = shift;
+ 
+  eval {
+    my $data = ref $json ? $json : JSON->new->utf8(1)->decode($json);
+    return next_urls_in_data($data); 
+  };
+  return;
+}
+
+
+sub elapsed_for_human {
+  my $from = shift;
+  my $to = shift // time;
+  return undef unless defined $from;
+  my $diff = $to-$from;
+
+  if ($diff > 86_400 * 2) {
+    my $day  = int($diff/86_400);
+    my $hour = int($diff%86_400 / 3600);
+    return sprintf("%d days %d hours", $day, $hour);
+  }
+  elsif ($diff > 3600 * 2) {
+    my $hour = int($diff/3600);
+    my $min  = int($diff%3600 / 60);
+    return sprintf("%d hours %d mins", $hour, $min);
+  }
+  elsif ($diff > 60 * 2) {
+    my $min  = int($diff/60);
+    my $sec  = int($diff%60);
+    return sprintf("%d mins %d secs", $min, $sec);
+  }
+  return sprintf("%d secs", $diff);
+}
+
+=head1 How to calculate moving averages?
+
+See http://en.wikipedia.org/wiki/Moving_average .
+
+culumative moving average
+  Aj = Ai + ( xj - Ai ) / j
+
+exponential moving average
+  alpha10      = ( 1 - exp ( - 1 / 10 )  = .09516258196404042684
+  alpha60      = ( 1 - exp ( - 1 / 60 )  = .01652854617838251052
+  alpha300     = ( 1 - exp ( - 1 / 300 ) = .00332778394547667848
+  alpha900     = ( 1 - exp ( - 1 / 900 ) = .00111049405572068678
+  1 - alpha10  = exp ( - 1 / 10 )        = .90483741803595957316
+  1 - alpha60  = exp ( - 1 / 60 )        = .98347145382161748948
+  1 - alpha300 = exp ( - 1 / 300 )       = .99667221605452332152
+  1 - alpha900 = exp ( - 1 / 900 )       = .99888950594427931322
+  Sn = alpha10 x Yn + ( 1 - alpha10 ) x Sn-1
+=cut
+
+sub average60 {
+  my ($val,$avg) = @_; $avg //= $val;
+  return (.01652854617838251052 * $val)+(1-.01652854617838251052)*$avg;
+}
+
+use Time::HiRes qw(gettimeofday tv_interval);
+
+sub time_this {
+  my $t0 = [gettimeofday];
+  my $t1 = $t0;
+  my %elapsed = ();
+  my %average60 = ();
+  return sub {
+    my $block = shift;
+    my $t2 = [gettimeofday];
+    if ($block eq 'report') {
+      return (map {
+          sprintf("%.4f / %.4f sec : $_",
+                  $average60{$_},
+                  $elapsed{$_});
+        } sort keys %elapsed),
+        sprintf("total: %.4f sec", tv_interval($t0, $t2));
+      ;
+    } else {
+      $elapsed{$block} = 0 unless exists $elapsed{$block};
+      $elapsed{$block} += tv_interval($t1, $t2);
+      $average60{$block} = average60(tv_interval($t1, $t2), $average60{$block});
+      $t1 = $t2;
+      return 1;
+    }
+  };
+}
+
+package Bridge;
+use Log::Log4perl qw(:easy);
+use JSON;
+Bridge::Util->import(qw(elapsed_for_human time_this));
+
+sub new {
+
+}
+
+sub stream {
+  my $mode = shift;
+  my $session = shift;
+  my $count = shift;
+  my $in  = Bridge::Input->open($session->in);
+  my $out = Bridge::Output->open($mode, $session->out);
+
+  defined $in  or do { warn "Failed to prepare input of stream"; return; };
+  defined $out or do { warn "Failed to prepare output of stream"; return; };
+
+  return 1 if $mode eq 'create';
+  DEBUG("\$in is of ".ref($in).", \$out is of ".ref($out));
+
+  $session->lock_sh(3) or die "cannot lock session: $!";
+
+  my $t = time_this();
+
+  for ( my $i = 0; 0 == $count or $i < $count; ) {
+    $t->("1.prepare");
+    my @urls = $session->next_urls;
+    last unless grep { defined $_ and $_ } @urls;
+    INFO("from=".$session->param('from')." to=".$session->param('to'));
+
+    my $res = $in->pull(@urls) or
+      die "Invalid response from input";
+    last if $main::SIGNALED_TO_QUIT;
+
+    $t->("2.pull");
+
+    DEBUG("res=$res");
+    if ( $res->is_success ) {
+      DEBUG("res->is_success = true");
+      $out->push($res->json);
+      $t->("3.push");
+      $i ++;
+
+      $session->next_urls($res->next_urls);
+      DEBUG("next from=".$session->param('from'));
+      $session->save or die "Failed to save session status";
+      $t->("4.update next_urls of session");
+    } else {
+      WARN("failed to pull from @urls");
+      sleep 1;
+    }
+
+    last if $main::SIGNALED_TO_QUIT;
+  }
+
+  #map { print STDERR $_, "\n"; } $t->("report");
+  $session->unlock;
+
+  INFO("got signal to quit") if $main::SIGNALED_TO_QUIT;
+  return 1;
+}
+
+package Bridge::Response;
+use Log::Log4perl qw(:easy);
+use JSON;
+Bridge::Util->import(qw(D next_urls_in_data));
+
+sub new {
+  my $class = shift;
+  my %arg = @_;
+  my $this = {
+    map { $_ => $arg{$_} } qw(type uri json obj next_urls),
+  };
+
+  bless $this, $class;
+  $this->_parse_json or return undef;
+  return $this;
+}
+
+my $missing_low_surrogate_character = 
+   q{missing low surrogate character in surrogate pair,}
+  .q{ at character offset (\d+) };
+my $missing_high_surrogate_character = 
+   q{missing high surrogate character in surrogate pair,}
+  .q{ at character offset (\d+) };
+
+sub _parse_json {
+  my $self = shift;
+  my $json = $self->json;
+  foreach my $try ( 1..100 ) {
+    eval { $self->{data} = decode_json($json); };
+    if ( $@ =~ m/^$missing_low_surrogate_character/o ) {
+      my $offset = ($1-16) > 0 ? ($1-16) : 0;
+      WARN("missing low surrogate character: ".D(substr($json, $offset, 64)));
+      INFO("uri = ".$self->{uri}->[0]);
+      #substr($json, $offset, 64) =~ s/\\uD[89A-B]\w\w(?!\\u)//oig;
+      my $r = substr($json, $offset) =~ s/\\uD[89A-B]\w\w(?!\\uD[C-F]\w\w)//oig;
+      # see https://en.wikipedia.org/wiki/UTF-16
+      # Range of surrogate pairs is 0xD800..0xDBFF for the lead, 0xDC00..0xDFFF for the trail.
+      # Since the ranges for the lead surrogates, trail surrogates,
+      # and valid BMP characters are disjoint, searches are simplified.
+      INFO("replaced $r times, fixed: ".D(substr($json, $offset, 64)));
+      next;
+    }
+    elsif ( $@ =~ m/^$missing_high_surrogate_character/o ) {
+      my $offset = ($1-16) > 0 ? ($1-16) : 0;
+      WARN("missing high surrogate character: ".D(substr($json, $offset, 64)));
+      INFO("uri = ".$self->{uri}->[0]);
+      my $r = substr($json, $offset) =~ s/(?<!\\uD[89A-B]\w\w)\\uD[C-F]\w\w//oig;
+      INFO("replaced $r times, fixed: ".D(substr($json, $offset, 64)));
+      next;
+    }
+    elsif ( $@ ) {
+      warn "tried $try times to parse json, but failed: $@";
+      return undef;
+    }
+    elsif ( $self->{data} ) {
+      $self->{next_urls} = [ next_urls_in_data($self->{data}) ];
+      return 1;
+    }
+    else {
+      ERROR("failed to parse json");
+      return undef;
+    }
+  }
+  return undef;
+}
+
+
+sub AUTOLOAD {
+  my $this = shift;
+  our $AUTOLOAD;
+  (my $methodName) = $AUTOLOAD =~ m/.*::(\w+)$/;
+  return if $methodName eq 'DESTROY';
+  $this->{obj}->$methodName(@_);
+}
+
+sub json { my $self = shift; return $self->{json}; }
+
+sub next_urls {
+  my $self = shift;
+  return @{$self->{next_urls}};
+}
+
+use URI;
+use URI::QueryParam;
+sub param {
+  my $self = shift;
+  my $name = shift;
+  my ($next_url, undef) = $self->next_urls;
+
+  my $url = URI->new($next_url);
+  return $url->query_param($name);
+}
+
+
+package Bridge::Input;
+use Log::Log4perl qw(:easy);
+
+sub open {
+  my $class = shift;
+  my $uri = shift;
+  if ( $uri =~ m|^/\w+|o ) {
+    my $type = "Bridge::Adapter::File";
+    my $obj  = $type->open("read", $uri) or return;
+    my $this = {
+      type => $type,
+      obj  => $obj,
+    };
+    # copy inheritance info.
+    @{ref($this).'::ISA'} = @{$type.'::ISA'};
+
+    return bless $this, $type;
+  }
+  elsif ( $uri =~ m|^http://.*/convbridge/|o ) {
+    my $type = "Bridge::Adapter::ConvB";
+    my $this = {
+      type => $type,
+      obj  => $type->new($uri),
+    };
+    #my $this = $type->new($uri);
+
+    bless $this, $class;
+    DEBUG("this is a object of $class, which type was $type");
+
+    # copy inheritance info.
+    #no strict 'refs';
+    #@{ref($this).'::ISA'} = @{$type.'::ISA'};
+    #map { DEBUG($type."::ISA=$_"); } @{$type.'::ISA'};
+
+    return $this;
+  }
+  return undef;
+}
+
+sub AUTOLOAD {
+  my $this = shift;
+  our $AUTOLOAD;
+  (my $methodName) = $AUTOLOAD =~ m/.*::(\w+)$/;
+  return if $methodName eq 'DESTROY';
+  $this->{obj}->$methodName(@_);
+}
+
+package Bridge::Output;
+use Log::Log4perl qw(:easy);
+
+sub open {
+  my $class = shift;
+  my $mode = shift;
+  my $uri = shift;
+  if ( $uri =~ m|^http://|o ) {
+    die "Unsupported destination type, http://";
+  } 
+  elsif ( $uri =~ m|^\w{1,16}://|o ) {
+    die "Unsupported destination type";
+  } 
+  else {
+    my $type = "Bridge::Adapter::File";
+    my $obj  = $type->open($mode, $uri) or return;
+    my $this = {
+      type => $type,
+      obj  => $obj,
+    };
+    bless $this, $class;
+    return $this;
+  }
+  return undef;
+}
+
+sub push {
+  my $self = shift;
+  DEBUG("\$self->{obj} is of ".ref($self->{obj}));
+  return $self->{obj}->push(@_);
+}
+
+package Bridge::Adapter::ConvB;
+use Log::Log4perl qw(:easy);
+use Encode qw(encode decode);
+
+sub new {
+  my $class = shift;
+  my $url = shift;
+
+  my $obj = {
+    ua => Bridge::UserAgent->new(),
+  };
+  bless $obj, $class;
+  return $obj;
+}
+
+sub pull {
+  my $self = shift;
+  my $res = $self->{ua}->get_failsafe(@_);
+  my $json;
+  if ( 1 ) { # Make $json 'UTF-8' encoded string.
+    $json = $res->decoded_content;
+    DEBUG("json=".decode('UTF-8', substr($json, 0, 300), Encode::FB_DEFAULT).
+          " ... ".decode('UTF-8', substr($json, -300), Encode::FB_DEFAULT));
+
+  } else { # Make $json decoded string.
+    # XXX json should be decoded from UTF-8 to prevent croak in decode_json()
+    # http://stackoverflow.com/questions/6234386/how-do-i-sanitize-invalid-utf-8-in-perl
+    # Encode::decode should use 'utf-8-strict' encoding.
+    $json = decode('UTF-8', $res->decoded_content, Encode::FB_DEFAULT);
+    DEBUG("json=".substr($json, 0, 300).
+          " ... ".substr($json, -300) );
+  }
+
+  return Bridge::Response->new(
+    type      => 'convb',
+    uri       => [@_],
+    json      => $json,
+    obj => $res,
+  );
+}
+
+package Bridge::Adapter::File;
+use Log::Log4perl qw(:easy);
+use Fcntl qw(:flock);
+
+sub open {
+  my $class = shift;
+  my $mode = shift;
+  my $file = shift;
+
+  my $this = {
+    name => $file,
+  };
+  bless $this, $class;
+
+  my $open_mode;
+  if ( $mode eq "read" ) {
+    $open_mode = "<";
+    if ( not -e $file ) {
+      ERROR("input file does not exist");
+      return undef;
+    }
+  }
+  elsif ( $mode eq "create" ) {
+    $open_mode = ">";
+    if ( -e $file ) {
+      ERROR("output file already exists");
+      return undef;
+    }
+  }
+  elsif ( $mode eq "resume" ) {
+    $open_mode = ">>";
+    if ( not -e $file ) {
+      ERROR("output file does not exist");
+      return undef;
+    }
+  }
+
+  open(my $fh, $open_mode, $file) or die "cannot open $mode $file: $!";
+  flock($fh, LOCK_EX|LOCK_NB) or die "cannot lock file: $!";
+  $this->{fh} = $fh;
+
+  $this->push("#!/usr/bin/env bridge", "") if $mode eq "create";
+  
+  return $this;
+}
+
+sub push {
+  my $self = shift;
+  map { DEBUG("push '".substr($_,0,60)."'"); } @_;
+  DEBUG("\$self->{fh}=".$self->{fh});
+  map {
+    print { $self->{fh} } $_, "\n" or
+      die "Cannot write data to file, ".$self->{name}.": $!";
+  } @_;
+  return scalar @_;
+}
+
+sub pull {
+  my $self = shift;
+  my $uri = shift;
+  my $offset = 0;
+  my (undef, $fragment) = split(/#/, $uri, 2);
+  if ( $fragment and $fragment =~ m/(^|;|&)from=(\d+)/o ) {
+    $offset = $2;
+  }
+  DEBUG("offset=$offset");
+
+  unless ( $offset == tell $self->{fh} ) {
+    seek($self->{fh}, $offset, 0) # SEEK_SET
+      or die "cannot seek to $offset: $!";
+  }
+
+  my $json;
+  while ( readline $self->{fh} ) {
+    chomp;
+    next unless $_;
+    $json = $_;
+    last;
+  }
+
+  return Bridge::Response->new(
+    type      => 'file',
+    uri       => [$uri],
+    json      => $json,
+  );
+}
+
+package Bridge::Session;
+use Log::Log4perl qw(:easy);
+use English -no_match_vars;
+use File::Basename; # basename
+use Fcntl qw(:flock SEEK_END);
+Bridge::Util->import(qw(name_from));
+
+sub session_dir {
+  our $SESSION_DIR;
+
+  my $dir = shift;
+  $SESSION_DIR = $dir if defined $dir;
+
+  if ( not defined $SESSION_DIR ) {
+    $SESSION_DIR = glob "~";
+    $SESSION_DIR .= "/.convbridge";
+    DEBUG("set SESSION_DIR to default, $SESSION_DIR");
+  }
+  return $SESSION_DIR;
+}
+
+sub list {
+  my $class = shift;
+  die "Invalid method call" unless $class eq "Bridge::Session";
+  my $pattern = shift;
+  _init_status_dir();
+  my $status_dir = session_dir();
+  my @session_files = map { basename($_); } <"$status_dir/$pattern">;
+  #opendir(my $dh, $status_dir) or die "cannot opendir $status_dir: $!";
+  #my @session_files = grep { not /^\./ and -f "$status_dir/$_" } readdir($dh);
+  #closedir($dh);
+
+  return sort { $a->name cmp $b->name }
+    grep { defined }
+    map {
+      Bridge::Session->peek($_);
+    } @session_files;
+}
+
+sub _init_status_dir {
+  my $status_dir = session_dir;
+
+  if ( -d $status_dir and -w $status_dir ) {
+    INFO("status_dir, '$status_dir' is available.");
+    return 1;
+  }
+  elsif ( mkdir($status_dir, 0755) ) {
+    INFO("status_dir, '$status_dir' is created.");
+    return 1;
+  }
+  else {
+    ERROR("status_dir, '$status_dir' is not available.");
+    return undef;
+  }
+}
+
+sub _new {
+  my $class = shift;
+  my $name  = shift;
+  my $self  = {
+    name => $name,
+    ctime   => time, # create time of this session
+    mtime   => time, # modifiy time of this session
+    started => time, # start of this session object
+    elapsed => 0,    # elapsed time while session is activated
+    transfered => 0,
+    pid => 0,
+    in => '',
+    out => '',
+    next_urls => [ ],
+  };
+  return bless $self, $class;
+}
+
+sub new {
+  my $class = shift;
+  my %options = @_;
+
+  my $in  = $options{in};
+  my $out = $options{out};
+  my $name = join(".",
+    name_from($in),
+    name_from($out),
+    $PROCESS_ID,
+  );
+  # name is unique and there should be no race condition due to 
+  # that PROCESS_ID is included.
+
+  my $self = $class->_new($name);
+  $self->{pid} = $PROCESS_ID;
+  $self->{in}  = $in;
+  $self->{out} = $out;
+  $self->{next_urls} = [ $in ];
+
+  my $session_file = join("/", session_dir(), $name);
+  if ( -e $session_file ) {
+    ERROR("session already exists: $name");
+    return undef;
+  }
+
+  open(my $fh, ">", $session_file) or die "cannot open > $session_file: $!";
+  $self->{fh} = $fh;
+
+  $self->lock_sh or die "cannot lock session file: $!";
+  $self->{owner} = 1;
+
+  $self->save;
+  return $self;
+}
+
+sub load {
+  my $class = shift;
+  my $name = shift;
+  my $self = $class->peek($name) or return;
+
+  $self->lock_sh or die "cannot lock session file: $!";
+  $self->{owner} = 1;
+  $self->{started} = time;
+
+  $self->save;
+  return $self;
+}
+
+sub peek {
+  my $class = shift;
+  my $name = shift;
+  my $session_file = join("/", session_dir(), $name);
+
+  if ( not -e $session_file ) {
+    ERROR("session does not exist: $name");
+    return undef;
+  }
+
+  my $self = $class->_new($name);
+
+  open(my $fh, "+<", $session_file) or die "cannot open +< $session_file: $!";
+  $self->{fh} = $fh;
+
+  my $locked = $self->lock_sh and do {
+    my @stat = stat $fh;
+    my %names = map { $_ => 1 } qw(ctime mtime elapsed pid in out next_urls);
+    map {
+      if ($$_[0] eq 'next_urls') { push @{$self->{next_urls}}, $$_[1]; }
+      else                       { $self->{lc $$_[0]} = $$_[1]; }
+    } grep { $names{lc $$_[0]} }
+      grep { defined $_ and ref $_ eq 'ARRAY'; }
+      map { chomp; [split(/=/, $_, 2)]; } <$fh>;
+
+    # $self will be unlocked in DESTROY 
+    return unless defined $self->{in}
+      and defined $self->{out}
+      and ref $self->{next_urls} eq 'ARRAY'
+      and defined $self->{next_urls}->[0];
+ 
+  };
+  $locked or die "cannot lock session file: $!";
+
+  $self->unlock;
+  return $self;
+}
+
+sub DESTROY {
+  my $self = shift;
+  DEBUG("session object of ".$self->name." is destroyed.");
+  flock($self->{fh}, LOCK_UN);
+  close($self->{fh});
+}
+
+sub lock_sh {
+  my $self = shift;
+  my $locked = $self->_lock_with_timeout(LOCK_SH, shift)
+    and $self->{lock_sh} = 1;
+  return $locked;
+}
+
+sub lock_ex {
+  my $self = shift;
+  unless ( $self->{lock_sh} ) {
+    ERROR("invalid attempt to get exclusive lock without shared lock");
+    return;
+  }
+  my $locked = $self->_lock_with_timeout(LOCK_EX, shift);
+  return $locked;
+}
+
+sub _lock_with_timeout {
+  my $self = shift;
+  my $lock = shift;
+  my $timeout = shift // 2;
+
+  my $locked;
+  my $ALARM_EXCEPTION = "alarm clock for flock";
+  eval {
+    local $SIG{ALRM} = sub { die $ALARM_EXCEPTION };
+    alarm $timeout;
+    $locked = flock($self->{fh}, $lock);
+    alarm 0;
+  };
+  if ($@ and $@ !~ quotemeta($ALARM_EXCEPTION)) {
+    WARN("failed to lock: $@");
+    return;
+  }
+
+  return $locked;
+}
+
+sub unlock {
+  my $self = shift;
+  my $unlocked = flock($self->{fh}, LOCK_UN)
+    and $self->{lock_sh} = 0;
+  $unlocked or WARN("failed to unlock: $!");
+  return $unlocked;
+}
+
+sub remove {
+  my $self = shift;
+  my $session_file = join("/", session_dir(), $self->name);
+  unlink $session_file;
+}
+
+sub serialize {
+  my $self = shift;
+
+  return join ("\n",
+    q(ctime=).$self->{ctime},
+    q(mtime=).$self->{mtime},
+    q(elapsed=).$self->elapsed,
+    q(pid=).$self->{pid},
+    q(in=).$self->{in},
+    q(out=).$self->{out},
+    (map { q(next_urls=).$_ } @{$self->{next_urls}}),
+    '',
+  );
+}
+
+sub stop {
+  my $self = shift;
+  kill 'SIGINT', $self->pid;
+  my $lock_prev = $self->{lock_sh} ? LOCK_SH : LOCK_UN;
+  my $locked = ($self->lock_sh and $self->lock_ex(10))
+    or die "failed to stop session, PID=".$self->pid;
+  flock($self->{fh}, $lock_prev)
+    or die "cannot restore the lock(=$lock_prev) of session file: $!";
+
+  return 1;
+}
+
+use URI;
+use URI::QueryParam;
+sub param {
+  my $self = shift;
+  my $name = shift;
+  my ($next_url, undef) = $self->next_urls;
+
+  my $url = URI->new($next_url);
+  return $url->query_param($name);
+}
+
+sub is_active {
+  my $self = shift;
+  my $lock_prev = $self->{lock_sh} ? LOCK_SH : LOCK_UN;
+
+  my $ex = flock($self->{fh}, LOCK_EX|LOCK_NB);
+  DEBUG("ex = $ex: $!");
+  WARN("ex = $ex: $!") if $ex == 0 and $! ne "Resource temporarily unavailable";
+
+  flock($self->{fh}, $lock_prev)
+    or die "cannot restore the lock(=$lock_prev) of session file: $!";
+  return $ex ? 0 : 1;
+}
+
+sub state {
+  my $self = shift;
+  return "active" if $self->is_active;
+  return "completed" unless scalar $self->next_urls;
+  my @next_urls = $self->next_urls;
+  return "error" unless $next_urls[0];
+  #my $state = join(":", map { length $_ } @next_urls);
+  #return "stopped-$state";
+  return "stopped";
+}
+
+
+sub next_urls {
+  my $self = shift;
+  if ( scalar @_ ) {
+    $self->{next_urls} = [@_];
+    $self->{mtime} = time;
+  }
+  return @{$self->{next_urls}};
+}
+
+sub in   { my $self = shift; return $self->{in}; }
+sub out  { my $self = shift; return $self->{out}; }
+sub name { my $self = shift; return $self->{name}; }
+sub pid  { my $self = shift; $self->{pid} = shift // $self->{pid}; };
+sub atime { my $self = shift; return $self->{atime}; }
+sub mtime { my $self = shift; return $self->{mtime}; }
+sub ctime { my $self = shift; return $self->{ctime}; }
+sub elapsed {
+  my $self = shift;
+  return $self->{elapsed} unless $self->{owner};
+  return ($self->{elapsed} + time - $self->{started});
+}
+sub transfered { my $self = shift; return $self->{transfered}; }
+
+sub save {
+  my $self = shift;
+  $self->{owner} or die "This process is not the session owner.";
+
+  my $locked = $self->lock_ex and do {
+    my $fh = $self->{fh};
+    seek($fh, 0, 0) or die "cannot seek to 0: $!";
+    $self->pid($PROCESS_ID);
+    print $fh  $self->serialize;
+    DEBUG("saved session");
+ 
+    my $length = tell $fh or die "cannot tell session file: $!";
+    truncate $fh, $length; # truncate rest of the file
+  };
+  $locked or die "cannot lock session file: $!";
+  $self->lock_sh;
+  return 1;
+}
+
+package Bridge::UserAgent;
+use LWP::UserAgent;
+use Log::Log4perl qw(:easy);
+use constant AGENT_NAME => "Bridge-in-perl version 1407";
+
+sub new {
+  my $class = shift;
+  my %options = @_;
+  $options{agent}    //= AGENT_NAME;
+  $options{max_size} //= 10_000_000;
+  $options{timeout}  //= 60;
+  my $ua = LWP::UserAgent->new(
+    %options,
+  );
+  my $obj = { ua => $ua, };
+  bless $obj, $class;
+  return $obj;
+}
+
+sub get_failsafe {
+  my $self = shift;
+  my @urls = @_;
+
+  while ( 1 ) {
+    foreach ( @urls ) {
+      DEBUG "trying $_";
+      my $res = $self->{ua}->get($_);
+      return $res if $res->is_success;
+ 
+      ERROR "tried $_:". $res->status_line;
+    }
+    sleep 3;
+  }
+  return;
+}
+
+} # BEGIN {
+
+package main;
+
+sub rotate {
+  my @list  = @_;
+  my $index = -1;
+
+  return sub {
+      $index++;
+      $index = 0 if $index > $#list;
+      return $list[ $index ];
+  };
+}
+
+sub do_seed {
+  my $seed = shift or pod2usage(1);
+  scalar @_ or pod2usage(1);
+
+  my $ua = Bridge::UserAgent->new();
+  my $res = $ua->get_failsafe($seed) or
+    die "Cannot get seed url";
+
+  my @urls = split(/\n/, $res->decoded_content);
+  scalar @urls or die "No source url from seed";
+
+  my $destination = rotate(@_);
+  foreach my $i ( 0..$#urls ) {
+    my $pattern = $destination->();
+    do_session($urls[$i], sprintf($pattern, $i));
+
+    #print join("  ", "session",
+    #                 $urls[$i],
+    #                 sprintf($pattern, $i)
+    #      ), "\n";
+  }
+
+}
+
+sub do_pull {
+  my $in  = shift or pod2usage(1);
+  my $out = shift or pod2usage(1);
+  my $count = shift // 0;
+
+  eval {
+    my $session = Bridge::Session->new(
+      in  => $in,
+      out => $out,
+    ) or die "Failed to create a session";
+    DEBUG("created a session named ".$session->name);
+    #INFO("session:");
+    #INFO($session->serialize);
+    my $ok = Bridge::stream('create', $session);
+    unless ( $ok ) {
+      $session->remove;
+      exit 1;
+    };
+
+    $ok = Bridge::stream('resume', $session, $count);
+    exit 1 unless $ok;
+  }; exit 1 if $@;
+}
+
+sub do_session {
+  my $in  = shift or pod2usage(1);
+  my $out = shift or pod2usage(1);
+
+  eval {
+    my $session = Bridge::Session->new(
+      in  => $in,
+      out => $out,
+    ) or die "Failed to create a session";
+    DEBUG("created a session named ".$session->name);
+    #INFO("session:");
+    #INFO($session->serialize);
+    my $ok = Bridge::stream('create', $session);
+    unless ( $ok ) {
+      $session->remove;
+      exit 1;
+    };
+    print $session->name, "\n";
+  }; exit 1 if $@;
+}
+
+sub do_resume {
+  use POSIX;
+  $_[0] or pod2usage(1);
+  my $count = POSIX::isdigit($_[-1]) ? pop : 0;
+  DEBUG("count=$count, \$_[-1]=$_[-1]");
+
+  my @names;
+  map { push @names, $_->name; }
+  grep { not $_->is_active }
+  map { Bridge::Session->list($_); } @_;
+
+  if ( scalar @names == 1 ) {
+    my $session = Bridge::Session->load(shift @names);
+    my $ok = Bridge::stream('resume', $session, $count);
+    exit 1 unless $ok;
+  } else {
+
+    foreach my $name ( @names ) {
+      defined(my $pid = fork) or die "Cannot fork: $!";
+      if ( $pid ) {
+        use POSIX qw(:sys_wait_h);
+        select(undef, undef, undef, 0.25);
+        my $kid = waitpid($pid, WNOHANG);
+        print($name, "\n") if $kid == 0;
+        print($name, "!!!!\n") unless $kid == 0;
+      } else {
+        POSIX::setsid or die "Can’t start a new session: $!";
+        umask 0;
+       
+        my $session = Bridge::Session->load($name);
+        my $ok = Bridge::stream('resume', $session, $count) and 
+          exit 0;
+        
+        die "Failed to resume session, ".$name;
+      }
+    }
+  }; #exit 1 if $@;
+}
+
+sub filters {
+  my (@filtered, @rest);
+  my $filter = shift;
+  map { m/^$filter:\w+$/i
+    ? push @filtered, $_
+    : push @rest, $_
+  } @_;
+  return \@filtered, @rest;
+}
+
+sub state_filter {
+  my $filter = shift;
+  return @_ if scalar @{$filter} == 0;
+
+  my $last_filter = pop @{$filter};
+  my (undef, $state) = split(/:/, $last_filter);
+  return grep { $_->state eq lc $state } @_;
+}
+
+sub do_list {
+  my ($state_filter, @patterns) = filters('state', @_);
+
+  my @sessions;
+  map { push @sessions, Bridge::Session->list($_); }
+    scalar @patterns > 0 ? @patterns : '*';
+
+  @sessions = state_filter($state_filter, @sessions);
+
+  use POSIX qw(strftime);
+  my $f = "%F %T %p";
+
+  my $fmt = "%-24s  %5s  %-24s  %-20s  %-8s  %-s\n";
+  printf($fmt, qw(SESSION PID START DURATION STATE OWNER));
+
+  if ( scalar @sessions ) {
+    #printf("%d sessions in %s:\n", scalar @sessions, Bridge::Session::session_dir );
+
+    map {
+      printf($fmt,
+             $_->name, $_->pid,
+             '('.strftime($f,localtime($_->ctime||1)).')',
+             #'('.elapsed_for_human($_->ctime, $_->mtime).')',
+             '('.elapsed_for_human(0, $_->elapsed).')',
+             $_->state,
+             $_->{owner}//0,
+             #strftime($f,localtime($$_[2])),
+            );
+    } @sessions;
+  } else {
+    #printf("No sessions found in %s.\n", Bridge::Session::session_dir );
+    ;
+  }
+}
+
+sub do_status {
+  my $session_name = shift or pod2usage(1);
+
+  eval {
+    my $session = Bridge::Session->peek($session_name);
+    DEBUG("peeked a session named ".$session->name);
+    print $session->serialize;
+  }; exit 1 if $@;
+}
+
+sub do_stop {
+  $_[0] or pod2usage(1);
+  my @sessions;
+  map { push @sessions, Bridge::Session->list($_); } @_;
+
+  eval {
+    foreach my $session ( @sessions ) {
+      $session->is_active or next;
+      $session->stop and
+        print($session->name, "\n") and
+        next;
+      
+      die "Failed to stop session, ".$session->name;
+    }
+  }; exit 1 if $@;
+}
+
+sub do_remove {
+  $_[0] or pod2usage(1);
+  my @sessions;
+  map { push @sessions, Bridge::Session->list($_); } @_;
+
+  eval {
+    foreach my $session ( @sessions ) {
+      if ( $session->is_active ) {
+        warn "Unable to remove active session. Stop the session first.";
+        exit 1;
+      }
+      $session->remove and
+        print($session->name, "\n") and
+        next;
+      
+      die "Failed to remove session, ".$session->name;
+    }
+  }; exit 1 if $@;
+}
+
+sub xxx_view {
+  my $in = shift or pod2usage(1);
+
+  open(my $fh, "<:encoding(UTF-8)", $in) or die "cannot open < $in: $!";
+  my $t = time_this();
+  my $lineno = 0;
+  while(<$fh>) {
+    $t->("1.read");
+    chomp;
+    print ++$lineno, ": ";
+    if ( length $_ < 1  )         { print "\n"; }
+    elsif ( m|^#!/usr/bin/env|o ) { print "#!\n"; }
+    else                          { print substr($_, 0, 60), "\n" };
+    $t->("2.print");
+  }
+
+  map { print $_, "\n"; } $t->("report");
+
+  close($fh);
+}
+
+sub xxx_test {
+
+  die "working on test";
+}
+
+
+__DATA__
+
