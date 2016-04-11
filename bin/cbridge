@@ -168,6 +168,8 @@ sub next_urls_in_data {
   my ($name, undef) = grep { defined } map {
     exists $data->{$_} ? $_ : undef;
   } qw(next_urls next_url nextUrls nextUrl NextUrls NextUrl);
+
+  return undef unless $name; # next_url is not found.
   DEBUG("found: $name");
  
   if (ref $data->{$name} eq 'ARRAY') {
@@ -175,7 +177,7 @@ sub next_urls_in_data {
     DEBUG("urls[".(scalar @urls)."]=(".join(",", @urls).")");
     return @urls;
   }
-  return;
+  return undef; # next_url is invalid.
 }
 
 sub next_urls_in_json {
@@ -278,10 +280,11 @@ sub stream {
   my $mode = shift;
   my $session = shift;
   my $count = shift;
-  my $in  = Bridge::Input->open($session->in);
-  my $out = Bridge::Output->open($mode, $session->out);
 
+  my $in  = Bridge::Input->open($session->in);
   defined $in  or do { warn "Failed to prepare input of stream"; return; };
+
+  my $out = Bridge::Output->open($mode, $session->out);
   defined $out or do { warn "Failed to prepare output of stream"; return; };
 
   return 1 if $mode eq 'create';
@@ -383,7 +386,7 @@ sub _parse_json {
       warn "tried $try times to parse json, but failed: $@";
       return undef;
     }
-    elsif ( $self->{data} ) {
+    elsif ( $self->{data} and defined next_urls_in_data($self->{data}) ) {
       $self->{next_urls} = [ next_urls_in_data($self->{data}) ];
       return 1;
     }
@@ -459,6 +462,30 @@ sub open {
 
     return $this;
   }
+  elsif ( $uri =~ m|^http://.*/|o ) {
+    # url 이 input 으로 주어진 경우, JSON 을 가져와 parse 를 시도해본다.
+    # JSON 에서 next_urls 가 정상적으로 포함된 경우, 정상적인 input 으로 간주한다.
+    my $type = "Bridge::Adapter::ConvB";
+    my $this = {
+      type => $type,
+      obj  => $type->new($uri),
+    };
+
+    bless $this, $class;
+    DEBUG("try to figure out if this is a ConvB json: $uri");
+    my $response = $this->pull($uri);
+    if ( $response ) {
+      DEBUG("this is a object of $class, which type was $type");
+      return $this;
+    } else {
+      ERROR("input is not a valid JSON of ConvBridge");
+      ERROR("input url = $uri");
+      return undef;
+    }
+  } else {
+    ERROR("Unknown input type: uri=${uri}");
+  }
+
   return undef;
 }
 
@@ -519,6 +546,7 @@ sub new {
 
 sub pull {
   my $self = shift;
+  DEBUG("trying to ua->get_failsafe(@_)");
   my $res = $self->{ua}->get_failsafe(@_);
   my $json;
   if ( 1 ) { # Make $json 'UTF-8' encoded string.
