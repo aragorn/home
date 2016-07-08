@@ -1,0 +1,14 @@
+#!/bin/bash
+
+set -o nounset
+set -o errexit
+
+PID=$1
+kill -0 ${PID} # Checks if the process of PID exists.
+
+for i in {1..60}
+do
+  jstack $PID > jstack.${PID}.${i}
+  sleep 1
+done
+
